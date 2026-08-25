@@ -2,16 +2,7 @@ import os
 from dataclasses import dataclass
 from pathlib import Path
 
-
-def _load_dotenv(path: Path) -> None:
-    if not path.exists():
-        return
-    for line in path.read_text(encoding="utf-8").splitlines():
-        stripped = line.strip()
-        if not stripped or stripped.startswith("#") or "=" not in stripped:
-            continue
-        key, _, value = stripped.partition("=")
-        os.environ.setdefault(key.strip(), value.strip().strip("'\""))
+from dotenv import load_dotenv
 
 
 @dataclass(frozen=True)
@@ -25,7 +16,7 @@ class Settings:
 
     @classmethod
     def load(cls, *, bot_token_required: bool = True) -> "Settings":
-        _load_dotenv(Path(".env"))
+        load_dotenv()
         bot_token = os.environ.get("TELEGRAM_BOT_TOKEN", "").strip()
         if bot_token_required and not bot_token:
             raise SystemExit("TELEGRAM_BOT_TOKEN is missing (put it in .env)")

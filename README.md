@@ -80,11 +80,14 @@ Known limits: tokens expire (users get a re-login prompt), OTP rate limits apply
 
 ## Layout
 
+- `src/outgy/text.py` — Persian/Arabic ↔ Latin digit conversion
+- `src/outgy/dates.py` — Tehran-time Jalali calendar helpers (today, windows, parsing)
+- `src/outgy/outage.py` — typed outage record parsed from برق من rows
 - `src/outgy/saapa.py` — برق من API client (auth, discovery, outages)
 - `src/outgy/store.py` — encrypted subscription store + announced-outage dedup
 - `src/outgy/bot.py` — Telegram handlers & conversations
 - `src/outgy/poller.py` — polling/alerting daemon loop
-- `src/outgy/format.py` — Persian/Jalali message formatting
+- `src/outgy/format.py` — English CLI + Persian HTML renderers
 - `src/outgy/config.py`, `src/outgy/__main__.py` — settings & CLI entrypoint
 
 ## License

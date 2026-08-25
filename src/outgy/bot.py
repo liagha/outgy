@@ -1,6 +1,6 @@
 import asyncio
 import logging
-import re
+from enum import IntEnum, auto
 
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.ext import (
@@ -13,12 +13,12 @@ from telegram.ext import (
     filters,
 )
 
-from .format import format_outages
+from . import format
+from .outage import Outage
 from .saapa import (
     BILL_ID_RE,
     MOBILE_RE,
     OTP_CODE_RE,
-    Outage,
     SaapaAuthError,
     SaapaClient,
     SaapaError,
@@ -30,14 +30,19 @@ from .saapa import (
     normalize_name,
     provider_code,
     provider_name,
-    to_latin_digits,
 )
 from .store import Store
+from .text import digits_only
 
 logger = logging.getLogger(__name__)
 
-ASK_PHONE, ASK_CODE = range(2)
-M_PROVINCE, M_SERIAL = range(2)
+
+class State(IntEnum):
+    PHONE = auto()
+    CODE = auto()
+    PROVINCE = auto()
+    SERIAL = auto()
+
 
 WELCOME = (
     "👋 سلام!\n"
@@ -89,8 +94,6 @@ METER_ASK_SERIAL = (
     "(روی پلاک کنتور برق منزل نوشته شده)\n\n/cancel — انصراف"
 )
 
-METER_SEARCHING = "در حال جستجو..."
-
 METER_NO_RESULT = (
     "❌ با این شماره بدنه در این استان اشتراکی پیدا نشد.\n"
     "شماره را دوباره بررسی کنید یا /meter را با استان درست تکرار کنید."
@@ -108,13 +111,9 @@ NOT_A_BILL = "لطفاً فقط <b>شناسه قبض</b> برق (عدد روی �
 
 INVALID_BILL = "❌ این شناسه قبض در سامانه «برق من» پیدا نشد. لطفاً دوباره بررسی کنید."
 
-SERVICE_DOWN = (
-    "⚠️ سرویس «برق من» در دسترس نیست، چند لحظه بعد دوباره امتحان کنید."
-)
+SERVICE_DOWN = "⚠️ سرویس «برق من» در دسترس نیست، چند لحظه بعد دوباره امتحان کنید."
 
-TOKEN_EXPIRED = (
-    "🔑 ورود شما به «برق من» منقضی شده است. لطفاً دوباره /login کنید."
-)
+TOKEN_EXPIRED = "🔑 ورود شما به «برق من» منقضی شده است. لطفاً دوباره /login کنید."
 
 REGISTERED = (
     "✅ شناسه قبض <code>{bill}</code> ثبت شد.\n"
@@ -132,66 +131,204 @@ def _mask(bill_id: str) -> str:
     return bill_id[:4] + "*" * (len(bill_id) - 7) + bill_id[-3:]
 
 
-def _mask_mobile(mobile: str) -> str:
-    if len(mobile) != 11:
-        return mobile
-    return mobile[:4] + "***" + mobile[-3:]
-
-
 def _bill_buttons(bills: list[dict]) -> list[list[InlineKeyboardButton]]:
     buttons = []
     seen: set[str] = set()
     for item in bills:
-        bid = extract_bill_id(item)
-        if not bid or bid in seen:
+        bill_id = extract_bill_id(item)
+        if not bill_id or bill_id in seen:
             continue
-        seen.add(bid)
-        label = bill_label(item) or _mask(bid)
-        buttons.append([InlineKeyboardButton(label[:48], callback_data=f"bill:{bid}")])
+        seen.add(bill_id)
+        label = bill_label(item) or _mask(bill_id)
+        buttons.append([InlineKeyboardButton(label[:48], callback_data=f"bill:{bill_id}")])
     return buttons
+
+
+def _province_buttons(providers: list[dict]) -> list[list[InlineKeyboardButton]]:
+    return [
+        [
+            InlineKeyboardButton(
+                provider_name(p)[:48] or "?",
+                callback_data=f"mprov:{provider_code(p)}:{provider_name(p)[:24]}",
+            )
+        ]
+        for p in providers[:10]
+    ]
+
+
+def _deps(context: ContextTypes.DEFAULT_TYPE) -> tuple[Store, SaapaClient, int]:
+    data = context.application.bot_data
+    return data["store"], data["saapa"], data["settings"].announce_days
+
+
+async def _lookup(
+    saapa: SaapaClient, token: str, bill_id: str, announce_days: int
+) -> list[Outage]:
+    return await saapa.planned_blackouts(bill_id, max(announce_days, 7), token=token)
+
+
+async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    await update.message.reply_html(WELCOME)
+
+
+async def login_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> State:
+    await update.message.reply_html(LOGIN_ASK_PHONE)
+    return State.PHONE
+
+
+async def login_phone(update: Update, context: ContextTypes.DEFAULT_TYPE) -> State | int:
+    store, saapa, _ = _deps(context)
+    mobile = normalize_mobile(update.message.text or "")
+    if not MOBILE_RE.match(mobile):
+        await update.message.reply_text(LOGIN_BAD_PHONE)
+        return State.PHONE
+    try:
+        await saapa.send_otp(mobile)
+    except SaapaError as exc:
+        logger.warning("otp send failed for chat %s: %s", update.effective_chat.id, exc)
+        await update.message.reply_text(LOGIN_FAILED.format(reason="سرویس در دسترس نیست"))
+        return ConversationHandler.END
+    context.user_data["mobile"] = mobile
+    await update.message.reply_text(OTP_SENT)
+    return State.CODE
+
+
+async def login_code(update: Update, context: ContextTypes.DEFAULT_TYPE) -> State | int:
+    store, saapa, _ = _deps(context)
+    chat_id = update.effective_chat.id
+    code = digits_only(update.message.text or "")
+    if not OTP_CODE_RE.match(code):
+        await update.message.reply_text(LOGIN_BAD_CODE)
+        return State.CODE
+    mobile = context.user_data.get("mobile")
+    if not mobile:
+        await update.message.reply_text(NEED_LOGIN)
+        return ConversationHandler.END
+    try:
+        token = await saapa.verify_otp(mobile, code)
+    except SaapaRejected as exc:
+        logger.info("otp verify rejected for chat %s: %s", chat_id, exc)
+        await update.message.reply_text("❌ کد اشتباه یا منقضی شده، دوباره بفرستید:")
+        return State.CODE
+    except SaapaError as exc:
+        logger.warning("otp verify failed for chat %s: %s", chat_id, exc)
+        await update.message.reply_text(LOGIN_FAILED.format(reason="سرویس در دسترس نیست"))
+        return ConversationHandler.END
+    await asyncio.to_thread(store.set_token, chat_id, token)
+    context.user_data.pop("mobile", None)
+    try:
+        bills = await saapa.get_bills(token=token)
+    except SaapaError as exc:
+        logger.info("get_bills failed for chat %s: %s", chat_id, exc)
+        bills = []
+    buttons = _bill_buttons(bills)
+    if buttons:
+        await update.message.reply_html(
+            LOGIN_BILLS_ASK.format(done=LOGIN_DONE),
+            reply_markup=InlineKeyboardMarkup(buttons),
+        )
+    else:
+        await update.message.reply_html(LOGIN_NOBILLS.format(done=LOGIN_DONE))
+    return ConversationHandler.END
+
+
+async def login_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    context.user_data.pop("mobile", None)
+    await update.message.reply_text("انصراف داده شد.")
+    return ConversationHandler.END
+
+
+async def cmd_logout(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    store, _, _ = _deps(context)
+    await asyncio.to_thread(store.clear_token, update.effective_chat.id)
+    await update.message.reply_text(LOGGED_OUT)
+
+
+async def cmd_stop(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    store, _, _ = _deps(context)
+    chat_id = update.effective_chat.id
+    if await asyncio.to_thread(store.remove_user, chat_id):
+        await update.message.reply_text(STOPPED)
+    else:
+        await update.message.reply_text(UNREGISTERED)
+
+
+async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    store, saapa, announce_days = _deps(context)
+    chat_id = update.effective_chat.id
+    token = await asyncio.to_thread(store.get_token, chat_id)
+    bill_id = await asyncio.to_thread(store.get_bill, chat_id)
+    if not token or not bill_id:
+        await update.message.reply_html(WELCOME)
+        return
+    try:
+        outages = await _lookup(saapa, token, bill_id, announce_days)
+    except SaapaAuthError:
+        await update.message.reply_text(TOKEN_EXPIRED)
+        return
+    except SaapaError as exc:
+        logger.warning("status lookup failed for chat %s: %s", chat_id, exc)
+        await update.message.reply_text(SERVICE_DOWN)
+        return
+    header = f"🔎 اشتراک شما: <code>{_mask(bill_id)}</code>\n\n"
+    await update.message.reply_html(header + format.html(outages))
+
+
+async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    store, saapa, announce_days = _deps(context)
+    chat_id = update.effective_chat.id
+    bill_id = digits_only(update.message.text or "")
+    if not BILL_ID_RE.match(bill_id):
+        await update.message.reply_html(NOT_A_BILL)
+        return
+    token = await asyncio.to_thread(store.get_token, chat_id)
+    if not token:
+        await update.message.reply_html(NEED_LOGIN)
+        return
+    await context.bot.send_chat_action(chat_id=chat_id, action="typing")
+    try:
+        outages = await _lookup(saapa, token, bill_id, announce_days)
+    except SaapaRejected:
+        await update.message.reply_html(INVALID_BILL)
+        return
+    except SaapaAuthError:
+        await update.message.reply_text(TOKEN_EXPIRED)
+        return
+    except SaapaError as exc:
+        logger.warning("verification failed for chat %s: %s", chat_id, exc)
+        await update.message.reply_text(SERVICE_DOWN)
+        return
+    await asyncio.to_thread(store.set_bill, chat_id, bill_id)
+    await update.message.reply_html(
+        REGISTERED.format(bill=_mask(bill_id)) + "\n\n" + format.html(outages)
+    )
 
 
 async def on_bill_pick(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     query = update.callback_query
-    await query.answer()
-    store: Store = context.application.bot_data["store"]
-    chat_id = update.effective_chat.id
     bill_id = query.data.removeprefix("bill:")
     if not BILL_ID_RE.match(bill_id):
         await query.answer("شناسه نامعتبر است", show_alert=True)
         return
-    await asyncio.to_thread(store.set_bill, chat_id, bill_id)
-    await query.edit_message_text(
-        PICKED_BILL.format(bill=_mask(bill_id)),
-    )
+    await query.answer()
+    store: Store = context.application.bot_data["store"]
+    await asyncio.to_thread(store.set_bill, update.effective_chat.id, bill_id)
+    await query.edit_message_text(PICKED_BILL.format(bill=_mask(bill_id)))
 
 
-def _province_buttons(providers: list[dict]) -> list[list[InlineKeyboardButton]]:
-    buttons = []
-    for p in providers[:10]:
-        label = provider_name(p) or "?"
-        buttons.append(
-            [InlineKeyboardButton(label[:48], callback_data=f"mprov:{provider_code(p)}:{label[:24]}")]
-        )
-    return buttons
-
-
-async def meter_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+async def meter_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> State | int:
     store, _, _ = _deps(context)
     token = await asyncio.to_thread(store.get_token, update.effective_chat.id)
     if not token:
         await update.message.reply_html(NEED_LOGIN)
         return ConversationHandler.END
     await update.message.reply_html(METER_ASK_PROVINCE)
-    return M_PROVINCE
+    return State.PROVINCE
 
 
-async def meter_province_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+async def meter_province_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> State | int:
     store, saapa, _ = _deps(context)
-    needle = normalize_name(update.message.text or "")
-    if not needle:
-        await update.message.reply_text(METER_PROVINCE_NOT_FOUND)
-        return M_PROVINCE
+    needle = (update.message.text or "").strip()
     providers = context.user_data.get("providers")
     if providers is None:
         try:
@@ -201,39 +338,41 @@ async def meter_province_text(update: Update, context: ContextTypes.DEFAULT_TYPE
             await update.message.reply_text(SERVICE_DOWN)
             return ConversationHandler.END
         context.user_data["providers"] = providers
-    matches = match_providers(providers, needle)
+    matches = match_providers(providers, needle) if needle else []
     if not matches:
         await update.message.reply_text(METER_PROVINCE_NOT_FOUND)
-        return M_PROVINCE
+        return State.PROVINCE
     if len(matches) == 1:
-        context.user_data["co_code"] = provider_code(matches[0])
-        await update.message.reply_html(f"استان: <b>{provider_name(matches[0])}</b>\n\n" + METER_ASK_SERIAL)
-        return M_SERIAL
+        chosen = matches[0]
+        context.user_data["co_code"] = provider_code(chosen)
+        await update.message.reply_html(
+            f"استان: <b>{provider_name(chosen)}</b>\n\n{METER_ASK_SERIAL}"
+        )
+        return State.SERIAL
     await update.message.reply_text(
         METER_PICK_PROVINCE,
         reply_markup=InlineKeyboardMarkup(_province_buttons(matches)),
     )
-    return M_PROVINCE
+    return State.PROVINCE
 
 
-async def meter_province_pick(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+async def meter_province_pick(update: Update, context: ContextTypes.DEFAULT_TYPE) -> State:
     query = update.callback_query
     await query.answer()
-    data = query.data.removeprefix("mprov:")
-    code, _, label = data.partition(":")
+    code, _, label = query.data.removeprefix("mprov:").partition(":")
     context.user_data["co_code"] = code
     await query.edit_message_text(f"استان: {label}")
     await query.message.reply_html(METER_ASK_SERIAL)
-    return M_SERIAL
+    return State.SERIAL
 
 
-async def meter_serial(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+async def meter_serial(update: Update, context: ContextTypes.DEFAULT_TYPE) -> State | int:
     store, saapa, _ = _deps(context)
     chat_id = update.effective_chat.id
-    serial = to_latin_digits(update.message.text or "").strip().replace(" ", "")
-    if not re.match(r"^\d{3,20}$", serial):
+    serial = digits_only(update.message.text or "")
+    if not 3 <= len(serial) <= 20:
         await update.message.reply_text("❌ شماره بدنه فقط عدد است، دوباره بفرستید:")
-        return M_SERIAL
+        return State.SERIAL
     token = await asyncio.to_thread(store.get_token, chat_id)
     co_code = context.user_data.get("co_code")
     if not token or not co_code:
@@ -267,162 +406,12 @@ async def meter_serial(update: Update, context: ContextTypes.DEFAULT_TYPE) -> in
     return ConversationHandler.END
 
 
-def _deps(context: ContextTypes.DEFAULT_TYPE) -> tuple[Store, SaapaClient, int]:
-    data = context.application.bot_data
-    return data["store"], data["saapa"], data["settings"].announce_days
-
-
-async def _lookup(
-    saapa: SaapaClient, token: str, bill_id: str, announce_days: int
-) -> list[Outage]:
-    return await saapa.planned_blackouts(bill_id, max(announce_days, 7), token=token)
-
-
-async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    await update.message.reply_html(WELCOME)
-
-
-async def login_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    await update.message.reply_html(LOGIN_ASK_PHONE)
-    return ASK_PHONE
-
-
-async def login_phone(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    store, saapa, _ = _deps(context)
-    mobile = normalize_mobile(update.message.text or "")
-    if not MOBILE_RE.match(mobile):
-        await update.message.reply_text(LOGIN_BAD_PHONE)
-        return ASK_PHONE
-    try:
-        await saapa.send_otp(mobile)
-    except SaapaError as exc:
-        logger.warning("otp send failed for chat %s: %s", update.effective_chat.id, exc)
-        await update.message.reply_text(LOGIN_FAILED.format(reason="سرویس در دسترس نیست"))
-        return ConversationHandler.END
-    context.user_data["mobile"] = mobile
-    await update.message.reply_text(OTP_SENT)
-    return ASK_CODE
-
-
-async def login_code(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    store, saapa, _ = _deps(context)
-    chat_id = update.effective_chat.id
-    code = re.sub(r"[^\d]", "", to_latin_digits(update.message.text or ""))
-    if not OTP_CODE_RE.match(code):
-        await update.message.reply_text(LOGIN_BAD_CODE)
-        return ASK_CODE
-    mobile = context.user_data.get("mobile")
-    if not mobile:
-        await update.message.reply_text(NEED_LOGIN)
-        return ConversationHandler.END
-    try:
-        token = await saapa.verify_otp(mobile, code)
-    except SaapaRejected as exc:
-        logger.info("otp verify rejected for chat %s: %s", chat_id, exc)
-        await update.message.reply_text("❌ کد اشتباه یا منقضی شده، دوباره بفرستید:")
-        return ASK_CODE
-    except SaapaError as exc:
-        logger.warning("otp verify failed for chat %s: %s", chat_id, exc)
-        await update.message.reply_text(LOGIN_FAILED.format(reason="سرویس در دسترس نیست"))
-        return ConversationHandler.END
-    await asyncio.to_thread(store.set_token, chat_id, token)
-    context.user_data.pop("mobile", None)
-    try:
-        bills = await saapa.get_bills(token=token)
-    except SaapaError as exc:
-        logger.info("get_bills failed for chat %s: %s", chat_id, exc)
-        bills = []
-    buttons = _bill_buttons(bills)
-    if buttons:
-        await update.message.reply_html(
-            LOGIN_BILLS_ASK.format(done=LOGIN_DONE),
-            reply_markup=InlineKeyboardMarkup(buttons),
-        )
-    else:
-        await update.message.reply_html(LOGIN_NOBILLS.format(done=LOGIN_DONE))
-    return ConversationHandler.END
-
-
-async def login_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    context.user_data.pop("mobile", None)
-    await update.message.reply_text("انصراف داده شد.")
-    return ConversationHandler.END
-
-
-async def cmd_logout(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    store, _, _ = _deps(context)
-    chat_id = update.effective_chat.id
-    await asyncio.to_thread(store.clear_token, chat_id)
-    await update.message.reply_text(LOGGED_OUT)
-
-
-async def cmd_stop(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    store, _, _ = _deps(context)
-    chat_id = update.effective_chat.id
-    if await asyncio.to_thread(store.remove_user, chat_id):
-        await update.message.reply_text(STOPPED)
-    else:
-        await update.message.reply_text(UNREGISTERED)
-
-
-async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    store, saapa, announce_days = _deps(context)
-    chat_id = update.effective_chat.id
-    token = await asyncio.to_thread(store.get_token, chat_id)
-    bill_id = await asyncio.to_thread(store.get_bill, chat_id)
-    if not token or not bill_id:
-        await update.message.reply_html(WELCOME)
-        return
-    try:
-        outages = await _lookup(saapa, token, bill_id, announce_days)
-    except SaapaAuthError:
-        await update.message.reply_text(TOKEN_EXPIRED)
-        return
-    except SaapaError as exc:
-        logger.warning("status lookup failed for chat %s: %s", chat_id, exc)
-        await update.message.reply_text(SERVICE_DOWN)
-        return
-    header = f"🔎 اشتراک شما: <code>{_mask(bill_id)}</code>\n\n"
-    await update.message.reply_html(header + format_outages(outages))
-
-
-async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    store, saapa, announce_days = _deps(context)
-    chat_id = update.effective_chat.id
-    text = to_latin_digits((update.message.text or "").strip())
-    if not BILL_ID_RE.match(text):
-        await update.message.reply_html(NOT_A_BILL)
-        return
-    token = await asyncio.to_thread(store.get_token, chat_id)
-    if not token:
-        await update.message.reply_html(NEED_LOGIN)
-        return
-    bill_id = text
-    await context.bot.send_chat_action(chat_id=chat_id, action="typing")
-    try:
-        outages = await _lookup(saapa, token, bill_id, announce_days)
-    except SaapaRejected:
-        await update.message.reply_html(INVALID_BILL)
-        return
-    except SaapaAuthError:
-        await update.message.reply_text(TOKEN_EXPIRED)
-        return
-    except SaapaError as exc:
-        logger.warning("verification failed for chat %s: %s", chat_id, exc)
-        await update.message.reply_text(SERVICE_DOWN)
-        return
-    await asyncio.to_thread(store.set_bill, chat_id, bill_id)
-    await update.message.reply_html(
-        REGISTERED.format(bill=_mask(bill_id)) + "\n\n" + format_outages(outages)
-    )
-
-
 def register_handlers(app: Application) -> None:
     login_conv = ConversationHandler(
         entry_points=[CommandHandler("login", login_start)],
         states={
-            ASK_PHONE: [MessageHandler(filters.TEXT & ~filters.COMMAND, login_phone)],
-            ASK_CODE: [
+            State.PHONE: [MessageHandler(filters.TEXT & ~filters.COMMAND, login_phone)],
+            State.CODE: [
                 CommandHandler("cancel", login_cancel),
                 MessageHandler(filters.TEXT & ~filters.COMMAND, login_code),
             ],
@@ -432,11 +421,11 @@ def register_handlers(app: Application) -> None:
     meter_conv = ConversationHandler(
         entry_points=[CommandHandler("meter", meter_start)],
         states={
-            M_PROVINCE: [
+            State.PROVINCE: [
                 CallbackQueryHandler(meter_province_pick, pattern=r"^mprov:"),
                 MessageHandler(filters.TEXT & ~filters.COMMAND, meter_province_text),
             ],
-            M_SERIAL: [MessageHandler(filters.TEXT & ~filters.COMMAND, meter_serial)],
+            State.SERIAL: [MessageHandler(filters.TEXT & ~filters.COMMAND, meter_serial)],
         },
         fallbacks=[CommandHandler("cancel", login_cancel)],
     )

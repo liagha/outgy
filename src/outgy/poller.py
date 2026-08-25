@@ -3,8 +3,8 @@ import logging
 
 from telegram.ext import Application
 
-from .format import format_outages
-from .saapa import SaapaClient, SaapaAuthError, SaapaError
+from . import format
+from .saapa import SaapaAuthError, SaapaClient, SaapaError
 from .store import Store
 
 logger = logging.getLogger(__name__)
@@ -44,7 +44,7 @@ async def poll_once(app: Application) -> None:
         if fresh:
             logger.info("chat %s: %d new outage(s)", chat_id, len(fresh))
             try:
-                await bot.send_message(chat_id, format_outages(fresh), parse_mode="HTML")
+                await bot.send_message(chat_id, format.html(fresh), parse_mode="HTML")
             except Exception as exc:
                 logger.warning("send failed for chat %s: %s", chat_id, exc)
                 await asyncio.sleep(STAGGER_SECONDS)
@@ -55,7 +55,11 @@ async def poll_once(app: Application) -> None:
 
 async def run_poller(app: Application) -> None:
     settings = app.bot_data["settings"]
-    logger.info("poller started (interval=%ss, users=%d)", settings.poll_interval, len(app.bot_data["store"].user_ids()))
+    logger.info(
+        "poller started (interval=%ss, users=%d)",
+        settings.poll_interval,
+        len(app.bot_data["store"].user_ids()),
+    )
     while True:
         try:
             await poll_once(app)

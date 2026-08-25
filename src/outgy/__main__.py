@@ -1,14 +1,12 @@
 import argparse
 import asyncio
 import logging
-import re
 from pathlib import Path
 
 import httpx
 
+from . import format
 from .config import Settings
-from .format import format_outages
-from .poller import run_poller
 from .saapa import (
     BILL_ID_RE,
     MOBILE_RE,
@@ -21,8 +19,8 @@ from .saapa import (
     normalize_mobile,
     provider_code,
     provider_name,
-    to_latin_digits,
 )
+from .text import digits_only
 
 logger = logging.getLogger(__name__)
 
@@ -76,13 +74,13 @@ def _save_token_to_env(token: str) -> Path:
 def _print_bills(bills: list[dict]) -> None:
     found = False
     for item in bills:
-        bid = extract_bill_id(item)
+        bill_id = extract_bill_id(item)
         label = bill_label(item)
-        if not bid:
+        if not bill_id:
             continue
         found = True
         suffix = f"  {label}" if label else ""
-        print(f"  {bid}  {suffix}")
+        print(f"  {bill_id}  {suffix}")
     if not found:
         print("  (no bills with a recognizable bill ID)")
         print("  try: uv run outgy find <PROVINCE> <METER_SERIAL>")
@@ -100,7 +98,7 @@ async def _cli_login(settings: Settings) -> None:
         print(f"sms code sent to {mobile}")
         token = None
         for _ in range(3):
-            code = re.sub(r"\D", "", to_latin_digits(input("code: ")))
+            code = digits_only(input("code: "))
             try:
                 token = await saapa.verify_otp(mobile, code)
                 break
@@ -135,8 +133,8 @@ async def _cli_bills(settings: Settings) -> None:
 async def _cli_find(settings: Settings, province: str, serial: str) -> None:
     if not settings.saapa_token:
         raise SystemExit("not logged in — run: uv run outgy login")
-    serial = to_latin_digits(serial).strip().replace(" ", "").replace("/", "")
-    if not re.match(r"^\d{3,20}$", serial):
+    serial = digits_only(serial)
+    if not 3 <= len(serial) <= 20:
         raise SystemExit("meter body number must be 3-20 digits")
     async with httpx.AsyncClient(timeout=30) as http:
         saapa = SaapaClient(http, settings.saapa_base_url)
@@ -174,9 +172,7 @@ async def _cli_find(settings: Settings, province: str, serial: str) -> None:
 
 async def _cli_check(settings: Settings, bill_id: str, days: int) -> None:
     if not settings.saapa_token:
-        raise SystemExit(
-            "SAAPA_TOKEN is missing — run: uv run outgy login"
-        )
+        raise SystemExit("SAAPA_TOKEN is missing — run: uv run outgy login")
     async with httpx.AsyncClient(timeout=30) as http:
         saapa = SaapaClient(http, settings.saapa_base_url)
         try:
@@ -185,7 +181,7 @@ async def _cli_check(settings: Settings, bill_id: str, days: int) -> None:
             raise SystemExit(f"bargh-e man rejected this bill ID: {exc}")
         except SaapaError as exc:
             raise SystemExit(f"saapa request failed: {exc}")
-    print(format_outages(outages, html=False))
+    print(format.plain(outages))
 
 
 async def _post_init(app) -> None:
@@ -222,7 +218,9 @@ def _run_bot(settings: Settings) -> None:
     app.bot_data["settings"] = settings
     app.bot_data["store"] = store
     register_handlers(app)
-    logger.info("outgy starting (db=%s, poll_interval=%ss)", settings.db_path, settings.poll_interval)
+    logger.info(
+        "outgy starting (db=%s, poll_interval=%ss)", settings.db_path, settings.poll_interval
+    )
     app.run_polling(allowed_updates=["message"])
 
 
@@ -248,7 +246,7 @@ def main() -> None:
     elif command == "find":
         asyncio.run(_cli_find(settings, args.province, args.serial))
     elif command == "check":
-        bill_id = args.bill_id.strip()
-        if not BILL_ID_RE.match(to_latin_digits(bill_id)):
+        bill_id = digits_only(args.bill_id.strip())
+        if not BILL_ID_RE.match(bill_id):
             raise SystemExit("bill ID must be 8-18 digits")
-        asyncio.run(_cli_check(settings, to_latin_digits(bill_id), args.days))
+        asyncio.run(_cli_check(settings, bill_id, args.days))

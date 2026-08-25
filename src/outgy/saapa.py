@@ -1,12 +1,12 @@
 import asyncio
 import logging
 import re
-from dataclasses import dataclass
-from datetime import datetime
-from zoneinfo import ZoneInfo
 
 import httpx
-import jdatetime
+
+from .dates import window
+from .outage import Outage
+from .text import latin_digits
 
 logger = logging.getLogger(__name__)
 
@@ -17,15 +17,10 @@ GET_BILLS_PATH = "/api/ebills/GetBills"
 SEARCH_BRANCH_PATH = "/api/ebills/SearchBranchData"
 PROVIDERS_PATH = "/api/providers/list"
 CITIES_PATH = "/api/providers/cities"
-TEHRAN = ZoneInfo("Asia/Tehran")
 
-_DATE_RE = re.compile(r"^\d{4}/\d{1,2}/\d{1,2}$")
-_TIME_RE = re.compile(r"^\d{1,2}:\d{2}$")
 BILL_ID_RE = re.compile(r"^\d{8,18}$")
 MOBILE_RE = re.compile(r"^09\d{9}$")
 OTP_CODE_RE = re.compile(r"^\d{4,8}$")
-
-_DIGITS_FA = str.maketrans("۰۱۲۳۴۵۶۷۸۹٠١٢٣٤٥٦٧٨٩", "01234567890123456789")
 
 
 class SaapaError(RuntimeError):
@@ -40,80 +35,15 @@ class SaapaAuthError(SaapaError):
     pass
 
 
-def to_latin_digits(text: str) -> str:
-    return text.translate(_DIGITS_FA)
-
-
 def normalize_mobile(raw: str) -> str:
-    s = re.sub(r"[^\d+]", "", to_latin_digits(raw).strip())
-    if s.startswith("+98"):
-        s = "0" + s[3:]
-    elif s.startswith("0098"):
-        s = "0" + s[4:]
-    if len(s) == 10 and s.startswith("9"):
-        s = "0" + s
-    return s
-
-
-@dataclass(frozen=True)
-class Outage:
-    bill_id: str
-    date: str
-    start_time: str
-    stop_time: str
-    address: str
-    number: str
-
-    @property
-    def key(self) -> str:
-        return f"{self.date}|{self.start_time}|{self.stop_time}|{self.number}"
-
-    @property
-    def sort_key(self) -> tuple[int, ...]:
-        y, m, d = (int(p) for p in self.date.split("/"))
-        h, minute = (int(p) for p in self.start_time.split(":"))
-        return (y, m, d, h, minute)
-
-
-def today_jalali() -> jdatetime.date:
-    now = datetime.now(TEHRAN)
-    return jdatetime.date.fromgregorian(date=now.date())
-
-
-def _fmt_jdate(d: jdatetime.date) -> str:
-    return f"{d.year:04d}/{d.month:02d}/{d.day:02d}"
-
-
-def jalali_window(days: int) -> tuple[str, str]:
-    today = today_jalali()
-    end = today + jdatetime.timedelta(days=days)
-    return _fmt_jdate(today), _fmt_jdate(end)
-
-
-def _parse_response(resp: httpx.Response) -> dict:
-    if resp.status_code == 401:
-        raise SaapaAuthError("saapa token expired or invalid (401)")
-    if resp.status_code != 200:
-        detail = ""
-        try:
-            body = resp.json()
-            msg = str(body.get("message") or "")
-            errors = body.get("error")
-            if isinstance(errors, list) and errors:
-                extra = errors[0].get("ErrorMsg") if isinstance(errors[0], dict) else None
-                if extra:
-                    msg = f"{msg} ({extra})" if msg else str(extra)
-            detail = f": {msg}" if msg else ""
-        except ValueError:
-            detail = f": {resp.text[:120]}"
-        raise SaapaError(f"HTTP {resp.status_code}{detail}")
-    try:
-        body = resp.json()
-    except ValueError as exc:
-        raise SaapaError("non-JSON response") from exc
-    if body.get("status") != 200:
-        raise SaapaRejected(f"api status {body.get('status')}: {body.get('message', 'unknown')}")
-    return body
+    number = re.sub(r"[^\d+]", "", latin_digits(raw).strip())
+    if number.startswith("+98"):
+        number = "0" + number[3:]
+    elif number.startswith("0098"):
+        number = "0" + number[4:]
+    if len(number) == 10 and number.startswith("9"):
+        number = "0" + number
+    return number
 
 
 _BILL_ID_KEYS = ("bill_identifier", "bill_id", "BillId", "billID")
@@ -123,8 +53,8 @@ _BILL_LABEL_KEYS = ("address", "outage_address", "subscription_id", "name")
 def extract_bill_id(item: dict) -> str | None:
     for key in _BILL_ID_KEYS:
         value = item.get(key)
-        if value and BILL_ID_RE.match(to_latin_digits(str(value)).strip()):
-            return to_latin_digits(str(value)).strip()
+        if value and BILL_ID_RE.match(latin_digits(value).strip()):
+            return latin_digits(value).strip()
     return None
 
 
@@ -140,32 +70,32 @@ _NAME_CLEAN_RE = re.compile(r"[\s\u200c\u0640]+")
 _ARABIC_MAP = str.maketrans({"ي": "ی", "ك": "ک", "ة": "ه", "ؤ": "و"})
 
 
-def normalize_name(text: str) -> str:
-    s = to_latin_digits(text).translate(_ARABIC_MAP)
-    s = _NAME_CLEAN_RE.sub("", s).lower()
+def normalize_name(value: str) -> str:
+    cleaned = latin_digits(value).translate(_ARABIC_MAP)
+    cleaned = _NAME_CLEAN_RE.sub("", cleaned).lower()
     for word in ("استان", "شرکت", "توزیع", "منطقه", "برق"):
-        s = s.replace(word, "")
-    return s.strip("-_")
+        cleaned = cleaned.replace(word, "")
+    return cleaned.strip("-_")
 
 
-def provider_code(p: dict) -> str:
-    return str(p.get("code") or p.get("id") or p.get("co_code") or "")
+def provider_code(provider: dict) -> str:
+    return str(provider.get("code") or provider.get("id") or provider.get("co_code") or "")
 
 
-def provider_name(p: dict) -> str:
-    return str(p.get("name") or p.get("title") or "")
+def provider_name(provider: dict) -> str:
+    return str(provider.get("name") or provider.get("title") or "")
 
 
 def match_providers(providers: list[dict], needle: str) -> list[dict]:
-    q = normalize_name(needle)
+    query = normalize_name(needle)
     matches = []
-    for p in providers:
-        name = normalize_name(provider_name(p))
-        code = provider_code(p)
+    for provider in providers:
+        name = normalize_name(provider_name(provider))
+        code = provider_code(provider)
         if not name and not code:
             continue
-        if q == name or (q and q in name) or q == code:
-            matches.append(p)
+        if query == name or (query and query in name) or query == code:
+            matches.append(provider)
     return matches
 
 
@@ -233,7 +163,7 @@ class SaapaClient:
         return token
 
     async def planned_blackouts(self, bill_id: str, days: int, *, token: str) -> list[Outage]:
-        from_date, to_date = jalali_window(days)
+        from_date, to_date = window(days)
         body = await self._post(
             PLANNED_BLACKOUTS_PATH,
             {
@@ -243,29 +173,14 @@ class SaapaClient:
             },
             token=token,
         )
-
         outages = []
         for item in body.get("data") or []:
-            date = item.get("outage_date", "")
-            start = item.get("outage_start_time", "")
-            stop = item.get("outage_stop_time", "")
-            address = (item.get("address") or "").strip()
-            number = str(item.get("outage_number") or "")
-            if not (_DATE_RE.match(date) and _TIME_RE.match(start) and _TIME_RE.match(stop)):
+            outage = Outage.from_api(item, bill_id)
+            if outage:
+                outages.append(outage)
+            else:
                 logger.debug("skipping malformed outage entry: %r", item)
-                continue
-            outages.append(
-                Outage(
-                    bill_id=bill_id,
-                    date=date,
-                    start_time=start,
-                    stop_time=stop,
-                    address=address,
-                    number=number,
-                )
-            )
-        outages.sort(key=lambda o: o.sort_key)
-        return outages
+        return sorted(outages)
 
     async def account(self, *, token: str) -> tuple[list[dict], str | None]:
         body = await self._get(GET_BILLS_PATH, token=token)
@@ -310,25 +225,54 @@ class SaapaClient:
         phase: str | int | None = None,
         token: str | None = None,
     ) -> list[dict]:
-        def _int(value: str | int | None) -> int | None:
-            if value is None or value == "":
-                return None
-            try:
-                return int(to_latin_digits(str(value)).strip())
-            except ValueError:
-                return None
-
         payload: dict = {
             "search_type": int(search_type),
-            "co_code": _int(co_code),
-            "city_code": _int(city_code),
-            "phase": _int(phase),
+            "co_code": _as_int(co_code),
+            "city_code": _as_int(city_code),
+            "phase": _as_int(phase),
             "file_serial_number": None,
             "subscription_id": None,
         }
         if mobile_number:
             payload["mobile_number"] = mobile_number
         if serial_number:
-            payload["serial_number"] = to_latin_digits(serial_number).strip()
+            payload["serial_number"] = latin_digits(serial_number).strip()
         body = await self._post(SEARCH_BRANCH_PATH, payload, token=token)
         return [i for i in (body.get("data") or []) if isinstance(i, dict)]
+
+
+def _as_int(value: str | int | None) -> int | None:
+    if value is None or value == "":
+        return None
+    try:
+        return int(latin_digits(value).strip())
+    except ValueError:
+        return None
+
+
+def _parse_response(resp: httpx.Response) -> dict:
+    if resp.status_code == 401:
+        raise SaapaAuthError("saapa token expired or invalid (401)")
+    if resp.status_code != 200:
+        raise SaapaError(f"HTTP {resp.status_code}{_detail(resp)}")
+    try:
+        body = resp.json()
+    except ValueError as exc:
+        raise SaapaError("non-JSON response") from exc
+    if body.get("status") != 200:
+        raise SaapaRejected(f"api status {body.get('status')}: {body.get('message', 'unknown')}")
+    return body
+
+
+def _detail(resp: httpx.Response) -> str:
+    try:
+        body = resp.json()
+    except ValueError:
+        return f": {resp.text[:120]}"
+    message = str(body.get("message") or "")
+    errors = body.get("error")
+    if isinstance(errors, list) and errors and isinstance(errors[0], dict):
+        extra = str(errors[0].get("ErrorMsg") or "")
+        if extra:
+            message = f"{message} ({extra})" if message else extra
+    return f": {message}" if message else ""
