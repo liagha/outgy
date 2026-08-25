@@ -1,0 +1,53 @@
+{
+  "TimeStamp": "2026-08-25T15:00:00.000000000+03:30",
+  "status": 200,
+  "SessionKey": "<session>",
+  "message": "تعداد 3 خاموشی یافت شد",
+  "data": [
+    {
+      "reg_date": "1405/06/04",
+      "registrar": "setad",
+      "reason_outage": "مديريت انرژي",
+      "outage_date": "۱۴۰۵/۰۶/۰۴",
+      "outage_time": "22:00",
+      "outage_start_time": "۲۲:۰۰",
+      "outage_stop_time": "23:55",
+      "is_planned": true,
+      "address": "محله نمونه، بلوار آزمایشی",
+      "outage_address": "محله نمونه، بلوار آزمایشی",
+      "city": 2,
+      "outage_number": 400002222222,
+      "tracking_code": 40000000000002
+    },
+    {
+      "reg_date": "1405/06/03",
+      "registrar": "setad",
+      "reason_outage": "مديريت انرژي",
+      "outage_date": "1405/06/03",
+      "outage_time": "16:0",
+      "outage_start_time": "16:0",
+      "outage_stop_time": "18:00",
+      "is_planned": true,
+      "address": "",
+      "outage_address": "",
+      "city": 2,
+      "outage_number": "۴۰۰۰۰۱۱۱۱۱۱۱",
+      "tracking_code": 40000000000001
+    },
+    {
+      "reg_date": "1405/06/05",
+      "registrar": "setad",
+      "reason_outage": "مديريت انرژي",
+      "outage_date": "1405/06/05",
+      "outage_time": "25:00",
+      "outage_start_time": "25:00",
+      "outage_stop_time": "26:00",
+      "is_planned": true,
+      "address": "نامعتبر",
+      "outage_address": "نامعتبر",
+      "city": 2,
+      "outage_number": 400003333333,
+      "tracking_code": 40000000000003
+    }
+  ]
+}

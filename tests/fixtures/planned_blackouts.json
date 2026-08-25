@@ -1,0 +1,24 @@
+{
+  "TimeStamp": "2026-08-25T15:00:00.000000000+03:30",
+  "status": 200,
+  "SessionKey": "<session>",
+  "message": "تعداد 1 خاموشی یافت شد",
+  "data": [
+    {
+      "reg_date": "1405/06/03",
+      "registrar": "setad",
+      "reason_outage": "مديريت انرژي",
+      "outage_date": "1405/06/03",
+      "outage_time": "16:00",
+      "outage_start_time": "16:00",
+      "outage_stop_time": "18:00",
+      "is_planned": true,
+      "address": "خیابان نمونه، پلاک ۱",
+      "outage_address": "خیابان نمونه، پلاک ۱",
+      "city": 2,
+      "outage_number": 400001111111,
+      "tracking_code": 40000000000001
+    }
+  ],
+  "error": []
+}

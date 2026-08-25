@@ -1,0 +1,19 @@
+{
+  "TimeStamp": "2026-08-25T15:00:00.000000000+03:30",
+  "status": 200,
+  "SessionKey": "<session>",
+  "message": "عملیات با موفقیت انجام شد",
+  "data": [
+    {
+      "bill_identifier": "۱۱۱۱۲۲۲۲۳۳۳۳",
+      "address": "خیابان نمونه، پلاک ۱",
+      "subscription_id": "9000000001"
+    },
+    {
+      "bill_identifier": "999988887777",
+      "address": "محله نمونه، بلوار آزمایشی",
+      "subscription_id": ""
+    }
+  ],
+  "error": []
+}

@@ -1,0 +1,23 @@
+{
+  "TimeStamp": "2026-08-25T15:00:00.000000000+03:30",
+  "status": 200,
+  "SessionKey": "<session>",
+  "message": "عملیات با موفقیت انجام شد",
+  "data": {
+    "bills": [
+      {
+        "bill_identifier": "111122223333",
+        "address": "خیابان نمونه، پلاک ۱"
+      },
+      {
+        "bill_identifier": "999988887777",
+        "address": "محله نمونه، بلوار آزمایشی"
+      }
+    ],
+    "user_data": {
+      "name": "کاربر نمونه",
+      "mobile_number": "09120000000"
+    }
+  },
+  "error": []
+}
